@@ -26,12 +26,17 @@ st.markdown("""
     .metric-label { font-size: 11px; color: #888; font-weight: 700;
                     text-transform: uppercase; letter-spacing: 0.5px; }
     .metric-value { font-size: 22px; font-weight: 800; color: #1a1a1a; margin-top: 4px; }
+    .filter-header { font-size: 13px; font-weight: 700; color: #444;
+                     margin-bottom: 8px; margin-top: 4px; }
+    div[data-testid="stHorizontalBlock"] { align-items: flex-start; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CAMPAIGN_NAME_COL = "Campaign Name (Informational only)"
-PORTFOLIO_COL     = "Portfolio Name (Informational only)"
+CAMPAIGN_NAME_COL   = "Campaign Name (Informational only)"
+PORTFOLIO_COL       = "Portfolio Name (Informational only)"
+CAMPAIGN_STATE_COL  = "Campaign State (Informational only)"
+SERVING_STATUS_COL  = "Campaign Serving Status (Informational only)"
 
 DECODED_FIELDS = [
     "BRAND", "SKU", "TYPE", "TARGET_MODE", "MATCH_TYPE",
@@ -125,12 +130,16 @@ def load_and_process(file_bytes: bytes) -> dict:
             else:
                 df[col] = 0.0
 
-        if PORTFOLIO_COL not in df.columns:
-            df[PORTFOLIO_COL] = None
+        # Ensure portfolio and status cols exist
+        for col in [PORTFOLIO_COL, CAMPAIGN_STATE_COL, SERVING_STATUS_COL]:
+            if col not in df.columns:
+                df[col] = None
 
-        # Aggregate to campaign level (sum metrics, first portfolio)
+        # Aggregate to campaign level
         agg_dict = {col: "sum" for col in PERF_COLS}
-        agg_dict[PORTFOLIO_COL] = "first"
+        agg_dict[PORTFOLIO_COL]      = "first"
+        agg_dict[CAMPAIGN_STATE_COL] = "first"
+        agg_dict[SERVING_STATUS_COL] = "first"
 
         campaign_df = df.groupby(CAMPAIGN_NAME_COL, as_index=False).agg(agg_dict)
 
@@ -161,19 +170,19 @@ def render_metrics(df):
     spend  = df["Spend"].sum()
     sales  = df["Sales"].sum()
     orders = int(df["Orders"].sum())
-    acos   = spend / sales  if sales  > 0 else 0
-    roas   = sales / spend  if spend  > 0 else 0
-    ctr    = clicks / impr  if impr   > 0 else 0
-    cpc    = spend / clicks if clicks > 0 else 0
+    acos   = spend / sales   if sales  > 0 else 0
+    roas   = sales / spend   if spend  > 0 else 0
+    ctr    = clicks / impr   if impr   > 0 else 0
+    cpc    = spend / clicks  if clicks > 0 else 0
     cvr    = orders / clicks if clicks > 0 else 0
 
     row1 = st.columns(5)
     for col, (lbl, val) in zip(row1, [
-        ("💰 Spend",   f"${spend:,.2f}"),
-        ("📈 Sales",   f"${sales:,.2f}"),
-        ("📦 Orders",  f"{orders:,}"),
-        ("🎯 ACOS",    f"{acos*100:.2f}%"),
-        ("🔄 ROAS",    f"{roas:.2f}"),
+        ("💰 Spend",  f"${spend:,.2f}"),
+        ("📈 Sales",  f"${sales:,.2f}"),
+        ("📦 Orders", f"{orders:,}"),
+        ("🎯 ACOS",   f"{acos*100:.2f}%"),
+        ("🔄 ROAS",   f"{roas:.2f}"),
     ]):
         col.markdown(f'<div class="metric-card"><div class="metric-label">{lbl}</div>'
                      f'<div class="metric-value">{val}</div></div>', unsafe_allow_html=True)
@@ -193,17 +202,85 @@ def render_metrics(df):
     st.markdown("")
 
 
+def render_filters(df, sheet_name):
+    """Render visible filter row between metrics and table. Returns filtered df."""
+
+    st.markdown('<div class="filter-header">🔍 Filters</div>', unsafe_allow_html=True)
+
+    # Row 1: Portfolio + 4 decoded fields
+    row1 = st.columns(5)
+
+    # Portfolio
+    port_opts = sorted([
+        v for v in df[PORTFOLIO_COL].dropna().unique()
+        if str(v).strip() not in NULL_VALUES
+    ])
+    if port_opts:
+        sel = row1[0].multiselect("Portfolio", port_opts, key=f"{sheet_name}_portfolio")
+        if sel:
+            df = df[df[PORTFOLIO_COL].isin(sel)]
+
+    # Campaign State
+    state_opts = sorted([
+        v for v in df[CAMPAIGN_STATE_COL].dropna().unique()
+        if str(v).strip() not in NULL_VALUES
+    ])
+    if state_opts:
+        sel = row1[1].multiselect("Campaign State", state_opts, key=f"{sheet_name}_state")
+        if sel:
+            df = df[df[CAMPAIGN_STATE_COL].isin(sel)]
+
+    # Serving Status (only present on some tabs)
+    status_opts = sorted([
+        v for v in df[SERVING_STATUS_COL].dropna().unique()
+        if str(v).strip() not in NULL_VALUES
+    ])
+    if status_opts:
+        sel = row1[2].multiselect("Serving Status", status_opts, key=f"{sheet_name}_serving")
+        if sel:
+            df = df[df[SERVING_STATUS_COL].isin(sel)]
+
+    # BRAND & SKU in row 1 remaining slots
+    for idx, (field, label) in enumerate([("BRAND", "Brand"), ("SKU", "SKU")]):
+        if field in df.columns:
+            opts = sorted([v for v in df[field].dropna().unique() if v is not None])
+            if opts:
+                sel = row1[3 + idx].multiselect(label, opts, key=f"{sheet_name}_{field}")
+                if sel:
+                    df = df[df[field].isin(sel)]
+
+    # Row 2: remaining 12 decoded fields
+    remaining = [f for f in FILTER_FIELDS if f[0] not in ("BRAND", "SKU")]
+    row2 = st.columns(6)
+    for idx, (field, label) in enumerate(remaining):
+        if field not in df.columns:
+            continue
+        opts = sorted([v for v in df[field].dropna().unique() if v is not None])
+        if not opts:
+            continue
+        sel = row2[idx % 6].multiselect(label, opts, key=f"{sheet_name}_{field}")
+        if sel:
+            df = df[df[field].isin(sel)]
+
+    st.markdown("---")
+    return df
+
+
 def render_table(df, sheet_name):
-    display_cols = (
-        [CAMPAIGN_NAME_COL, PORTFOLIO_COL]
-        + DECODED_FIELDS
-        + ["Impressions", "Clicks", "Spend", "Sales", "Orders", "Units",
-           "Conv. Rate", "ACOS", "CPC", "ROAS"]
-    )
+    # Table columns: Campaign Name, Portfolio, State, Serving Status, then performance
+    # Decoded fields are NOT shown in table (used only as filters)
+    display_cols = [
+        CAMPAIGN_NAME_COL,
+        PORTFOLIO_COL,
+        CAMPAIGN_STATE_COL,
+        SERVING_STATUS_COL,
+        "Impressions", "Clicks", "Spend", "Sales", "Orders", "Units",
+        "Conv. Rate", "ACOS", "CPC", "ROAS",
+    ]
     display_cols = [c for c in display_cols if c in df.columns]
     show = df[display_cols].copy()
 
-    # Format
+    # Format numbers
     for c in ["Impressions", "Clicks", "Orders", "Units"]:
         if c in show.columns:
             show[c] = show[c].apply(lambda x: f"{int(x):,}")
@@ -216,7 +293,13 @@ def render_table(df, sheet_name):
     if "ROAS" in show.columns:
         show["ROAS"] = show["ROAS"].apply(lambda x: f"{x:.2f}")
 
-    show = show.rename(columns={CAMPAIGN_NAME_COL: "Campaign Name", PORTFOLIO_COL: "Portfolio"})
+    # Clean up column names for display
+    show = show.rename(columns={
+        CAMPAIGN_NAME_COL:  "Campaign Name",
+        PORTFOLIO_COL:      "Portfolio",
+        CAMPAIGN_STATE_COL: "Campaign State",
+        SERVING_STATUS_COL: "Serving Status",
+    })
 
     st.dataframe(show, use_container_width=True, height=480)
     st.caption(f"**{len(show):,}** campaigns shown")
@@ -238,11 +321,11 @@ st.title("📊 PPC Campaign Dashboard")
 uploaded = st.file_uploader(
     "Drop your Amazon PPC bulk Excel file (.xlsx)",
     type=["xlsx"],
-    help="The file should contain tabs: Sponsored Products Campaigns, Sponsored Brands Campaigns, SB Multi Ad Group Campaigns, Sponsored Display Campaigns"
+    help="File should contain: Sponsored Products Campaigns, Sponsored Brands Campaigns, SB Multi Ad Group Campaigns, Sponsored Display Campaigns"
 )
 
 if not uploaded:
-    st.info("👆 Upload your weekly PPC bulk file to get started. All processing happens locally — nothing is stored.")
+    st.info("👆 Upload your weekly PPC bulk file to get started. Files are processed in memory and never stored.")
     st.stop()
 
 with st.spinner("Loading data..."):
@@ -261,37 +344,12 @@ tab_objects = st.tabs([TAB_LABELS.get(s, s) for s in TAB_SHEETS if s in availabl
 for tab_obj, sheet_name in zip(tab_objects, [s for s in TAB_SHEETS if s in available]):
     with tab_obj:
         df = available[sheet_name].copy()
-        total = len(df)
 
-        with st.expander(f"🔍 Filters  —  {total:,} campaigns total", expanded=False):
-            fcols = st.columns(4)
-            col_idx = 0
-
-            # Portfolio filter first
-            if PORTFOLIO_COL in df.columns:
-                port_opts = sorted([
-                    v for v in df[PORTFOLIO_COL].dropna().unique()
-                    if str(v).strip() not in NULL_VALUES
-                ])
-                if port_opts:
-                    sel = fcols[col_idx % 4].multiselect(
-                        "Portfolio", port_opts, key=f"{sheet_name}_portfolio"
-                    )
-                    if sel:
-                        df = df[df[PORTFOLIO_COL].isin(sel)]
-                    col_idx += 1
-
-            # Decoded field filters
-            for field, label in FILTER_FIELDS:
-                if field not in df.columns:
-                    continue
-                opts = sorted([v for v in df[field].dropna().unique() if v is not None])
-                if not opts:
-                    continue
-                sel = fcols[col_idx % 4].multiselect(label, opts, key=f"{sheet_name}_{field}")
-                if sel:
-                    df = df[df[field].isin(sel)]
-                col_idx += 1
-
+        # 1. Metrics (unfiltered totals shown first, then filters applied)
         render_metrics(df)
+
+        # 2. Filters row (visible, between metrics and table)
+        df = render_filters(df, sheet_name)
+
+        # 3. Table (filtered)
         render_table(df, sheet_name)
